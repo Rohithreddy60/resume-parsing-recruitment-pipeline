@@ -1,0 +1,108 @@
+version: "3.9"
+
+services:
+  # User-facing FastAPI (non-blocking uploads)
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: recruitment_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/recruitment_db
+      AWS_DEFAULT_REGION: us-east-1
+      RESUME_S3_BUCKET: resumes-bucket
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/resume-jobs.fifo
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:resume-results
+      MAX_FILE_SIZE_MB: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pipeline_net
+
+  # Background async worker (CPU-bound parsing in process pool)
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: recruitment_worker
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/recruitment_db
+      AWS_DEFAULT_REGION: us-east-1
+      RESUME_S3_BUCKET: resumes-bucket
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/resume-jobs.fifo
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:resume-results
+      PIPELINE_MAX_WORKERS: "4"
+      POLL_INTERVAL_SECONDS: "5"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      replicas: 2  # Scale workers independently
+    networks:
+      - pipeline_net
+
+  # PostgreSQL with async driver support
+  postgres:
+    image: postgres:16-alpine
+    container_name: recruitment_postgres
+    environment:
+      POSTGRES_DB: recruitment_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    command: >
+      postgres
+        -c max_connections=100
+        -c shared_buffers=128MB
+        -c work_mem=4MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d recruitment_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pipeline_net
+
+  # LocalStack: S3 + SQS + SNS locally
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: recruitment_localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3,sqs,sns
+      DEBUG: 0
+      AWS_DEFAULT_REGION: us-east-1
+      PERSISTENCE: 1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - ./scripts/setup_localstack.sh:/etc/localstack/init/ready.d/setup.sh
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pipeline_net
+
+volumes:
+  postgres_data:
+  localstack_data:
+
+networks:
+  pipeline_net:
+    driver: bridge
